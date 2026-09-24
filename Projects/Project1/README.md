@@ -1,0 +1,488 @@
+# Project 1 — Credibility Scoring for Sources
+
+**CS676 Algorithms for Data Science · Pace University**
+
+> **Weight: 30% of your course grade · 100 points · +5% bonus for a live Hugging Face deployment**
+>
+> **One deliverable, one deadline.** Due date: **[DEADLINES.md](https://github.com/yiqiao-yin/pace-u-cs676/blob/main/DEADLINES.md)** — the only place dates live. The parts below are where the marks are, not a schedule.
+
+This is the first of the three projects that make up the bulk of your grade. You get
+a working chatbot for free. What you build is the part that decides whether a source
+can be trusted.
+
+---
+
+## Table of Contents
+
+- [The problem](#the-problem)
+- [What you are given](#what-you-are-given)
+- [⚠️ You need your own Anthropic API key](#-you-need-your-own-anthropic-api-key)
+- [Setup](#setup) — [with uv](#with-uv-recommended) · [fallback: venv and pip](#fallback-venv-and-pip)
+- [Run it](#run-it)
+- [The one function you are graded on](#the-one-function-you-are-graded-on)
+- [Measuring your work](#measuring-your-work)
+- [Ideas worth pursuing](#ideas-worth-pursuing)
+- [Deliverables and grading](#deliverables-and-grading)
+- [Bonus: deploy to Hugging Face (+5%)](#bonus-deploy-to-hugging-face-5)
+- [Troubleshooting](#troubleshooting)
+
+---
+
+## The problem
+
+A chatbot that answers from web sources is only as trustworthy as the sources it
+picked. Ask it a medical question and it may cite *The New England Journal of
+Medicine* — or a blog post written this morning by someone with a supplement to sell.
+The answer looks identical either way.
+
+Your task is to make that difference visible. Given a URL, return a credibility score
+and an explanation a reader can act on:
+
+```python
+score_url("https://www.nature.com/articles/s41586-021-03819-2")
+# {"score": 0.95, "explanation": "'nature.com' is a domain we recognize; served over HTTPS."}
+
+score_url("https://randomblog.blogspot.com/2024/03/my-thoughts.html")
+# {"score": 0.27, "explanation": "'blogspot.com' is a domain we recognize; served over HTTPS."}
+```
+
+Those two explanations are, frankly, not good enough. That is the point.
+
+---
+
+## What you are given
+
+| File | What it is | Do you edit it? |
+|---|---|---|
+| **`credibility.py`** | **The scorer. Your work goes here.** | **Yes — this is the assignment** |
+| `main.py` | Streamlit chat app; calls Claude, renders sources with coloured chips | Rarely |
+| `evaluate.py` | Scores 24 labelled URLs and reports your error | Extend the label set |
+| `test_credibility.py` | Contract tests — checks the output *shape*, not quality | Add your own cases |
+| `.env.example` | Template for API keys | Copy to `.env` |
+| `pyproject.toml` + `uv.lock` | The dependency list and the exact pinned versions. `uv sync` reads these | No |
+| `requirements.txt` | The same dependencies for the `pip` fallback, and what Hugging Face needs | No |
+
+The app already handles the Claude call, web search, citation extraction, session
+state, and the UI. **None of that is what you are graded on.**
+
+---
+
+## ⚠️ You need your own Anthropic API key
+
+**The chat does not work without one.** Get a key at
+[console.anthropic.com](https://console.anthropic.com/), then copy `.env.example` to
+`.env` and paste it in. The key is yours and **the calls are billed to your account** —
+nobody else's.
+
+You can do a large part of this assignment before spending anything:
+
+| Works with no key | Needs your key |
+| --- | --- |
+| `uv run python test_credibility.py` — 21 contract tests | the chat itself (`uv run streamlit run main.py`) |
+| `uv run python evaluate.py` — the 24-URL harness | `uv run python evaluate.py --llm` |
+| the whole rule-based scoring layer | `credibility.llm_opinion()` |
+| the sidebar URL scorer in the running app | |
+
+That split is deliberate. Improving the rule layer, measuring it, and defending the
+result is most of the grade, and none of it costs money.
+
+### What the key buys you
+
+Turning the LLM layer on is not decoration — it measurably improves the scorer:
+
+| | MAE | Band accuracy | Worst error |
+| --- | --- | --- | --- |
+| `uv run python evaluate.py` (rules only) | 0.142 | 66.7% | 0.410 |
+| `uv run python evaluate.py --llm` | **0.086** | **83.3%** | **0.230** |
+
+Both rows are the **unmodified baseline** — putting a key in `.env` improves the
+numbers on its own, before you change any code. That second row is what you should
+see on a fresh clone with a working key, and it is the more honest baseline to
+measure your own work against if you plan to use the LLM layer.
+
+If `--llm` gives you *identical* numbers to the plain run, something is wrong with
+how the key is reaching the script — it is not a property of the scorer. As of the
+current version `--llm` refuses to run at all without a key rather than quietly
+falling back, so this should announce itself.
+
+Most of that gain is on the held-out domains the lookup table has never seen. A JAMA
+article scores **0.52** on rules alone and **0.70** with the model, because the model
+knows what JAMA is and a hand-written domain list does not.
+
+That is also your warning: it is easy to "improve" the scorer by just calling the model
+more. The report asks you to justify an *algorithm*, and "I asked Claude" is not one.
+
+### A bug worth knowing about
+
+The first live run of `ask_claude()` returned **zero sources**. The function read
+citations off the text blocks, which is the obvious place — but `web_search_20260209`
+returns them in `web_search_tool_result` blocks instead, and `block.citations` is
+`None`. Nothing crashed and nothing was logged; the app just quietly showed no sources.
+
+It is fixed. Keep the failure mode in mind: an API returning an empty list where you
+expected data is far harder to notice than one that raises.
+
+---
+
+## Setup
+
+This project is managed by **[uv](https://docs.astral.sh/uv/)**. It is the same tool
+the homework folder uses, it works identically on macOS, Linux and Windows, and it is
+the path these instructions assume.
+
+### With `uv` (recommended)
+
+Install uv first — it is the only thing you need in advance. You do **not** need to
+install Python yourself; `pyproject.toml` declares the version this project wants and
+uv will fetch a suitable interpreter if you do not already have one.
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh     # macOS / Linux
+```
+
+```powershell
+powershell -c "irm https://astral.sh/uv/install.ps1 | iex"    # Windows
+```
+
+Then, identically on every platform:
+
+```bash
+# 1. Clone the course repo and enter this project
+git clone https://github.com/yiqiao-yin/pace-u-cs676.git
+cd pace-u-cs676/deliverable/project_1
+
+# 2. Create the environment and install everything
+uv sync
+
+# 3. Add your API key
+cp .env.example .env        # Windows: copy .env.example .env
+```
+
+Then open `.env` in any editor and paste your key in.
+
+That is the whole setup. There is **no virtual environment to activate** — `uv run`
+finds the right one on its own, which is why every command below starts with it.
+
+**What `uv sync` does.** It reads `pyproject.toml` for the dependency list and
+`uv.lock` for the exact version of all 68 packages, then builds an environment that
+matches. The lock file is committed, so you install the same versions everyone else
+has — including `anthropic 0.120.2`, which the scorer needs. If a run of yours behaves
+differently from a classmate's, it is not the dependencies.
+
+The first sync downloads a few hundred MB and takes a moment. Every later one is
+near-instant, and reports something like `Resolved 68 packages / Checked 64 packages`.
+
+### Fallback: venv and pip
+
+If uv will not install on your machine, or your environment forbids it, the classic
+route still works. `requirements.txt` carries the same pinned dependencies.
+
+You need **Python 3.10 or newer** and **git**. Check with `python --version`.
+
+**macOS / Linux**
+
+```bash
+git clone https://github.com/yiqiao-yin/pace-u-cs676.git
+cd pace-u-cs676/deliverable/project_1
+
+python3 -m venv .venv
+source .venv/bin/activate
+
+pip install -r requirements.txt
+
+cp .env.example .env
+nano .env          # or: open -e .env
+```
+
+**Windows** — use PowerShell, not the old `cmd` prompt.
+
+```powershell
+git clone https://github.com/yiqiao-yin/pace-u-cs676.git
+cd pace-u-cs676\deliverable\project_1
+
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+
+pip install -r requirements.txt
+
+copy .env.example .env
+notepad .env
+```
+
+> **PowerShell blocks the activate script?** You'll see *"running scripts is disabled
+> on this system."* Fix it once, for your user only:
+> ```powershell
+> Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+> ```
+
+On this route you must activate the environment in every new terminal, and you then
+drop the `uv run` prefix from the commands below — `uv run python evaluate.py` becomes
+`python evaluate.py`.
+
+---
+
+## Run it
+
+**Everything below works on a fresh clone with nothing edited and no API key.** If you
+have just run `uv sync`, you are ready.
+
+**Verify your setup first:**
+
+```bash
+uv run python test_credibility.py
+uv run python evaluate.py
+```
+
+The first ends with:
+
+```
+============================================================
+  21 passed, 0 failed
+============================================================
+```
+
+The second prints a row per URL and then this summary:
+
+```
+  URLs evaluated     : 24
+  Mean absolute error: 0.142   (lower is better; 0.000 is perfect)
+  Band accuracy      : 66.7%   (HIGH/MEDIUM/LOW chip correct)
+  Worst single error : 0.410
+  LLM layer          : off (rules only)
+```
+
+Those numbers are your **baseline**. Write them down — your job is to improve them, and
+Part 2 of the grade is the measured before-and-after. Seeing exactly these three figures
+also confirms your environment is correct, since everyone starts from the same locked
+dependencies.
+
+`LLM layer: off` is expected without a key. It is not an error — that is a plain
+`evaluate.py` run doing exactly what it should. You only need a key when you add
+`--llm`, and if you do that without one the script now stops and tells you, rather
+than printing rules-only numbers under an "LLM layer: on" heading.
+
+Look at the rows above the summary before you change anything. The scorer does well on
+domains in its lookup table and badly on the ones marked **HELD OUT** — the JAMA article
+is the worst single miss at 0.410, scored 0.52 purely because `jamanetwork.com` ends in
+`.com`. That gap is the assignment.
+
+If either command fails before printing anything, your environment is the problem, not
+your code — see [Troubleshooting](#troubleshooting).
+
+**Then start the app:**
+
+```bash
+uv run streamlit run main.py
+```
+
+It opens at `http://localhost:8501`. The sidebar shows which keys it found and lets
+you score any URL directly — useful for testing without burning chat tokens.
+
+---
+
+## The one function you are graded on
+
+Open `credibility.py`. It is heavily commented and ends with a numbered
+**KNOWN WEAKNESSES** list — twelve real defects in the code you have been handed.
+
+The baseline works in two layers:
+
+1. **Rules** — inspects the URL string. Runs with no API key, which is why the app
+   works immediately after cloning.
+2. **LLM** — one Claude call that judges the URL. Runs only when `ANTHROPIC_API_KEY`
+   is set, and silently degrades to rules-only when it is not.
+
+They are blended with a constant (`RULE_WEIGHT = 0.6`) that was never tested against
+anything. That constant is one of the twelve defects.
+
+**Do not change the contract.** `score_url()` must keep returning
+`{"score": float in [0,1], "explanation": str}`. Everything downstream depends on it,
+and `test_credibility.py` enforces it.
+
+---
+
+## Measuring your work
+
+`evaluate.py` scores 24 labelled URLs and reports three numbers:
+
+| Metric | Baseline | Meaning |
+|---|---|---|
+| Mean absolute error | **0.142** | Average distance from the expected score. Lower is better. |
+| Band accuracy | **66.7%** | How often the HIGH/MEDIUM/LOW chip is the right colour. |
+| Worst single error | **0.410** | Your most embarrassing miss. |
+
+The label set is split deliberately. The first block uses domains that already appear
+in the baseline's lookup table — it does well there, and that flatters it. The block
+marked **HELD OUT** uses domains the table has never seen, and that is where the
+baseline collapses: it scores a JAMA medical journal article at **0.52** because
+`jamanetwork.com` is a `.com` and it knows nothing else.
+
+A lookup table cannot generalize. Anything that can is worth more than a longer table.
+
+**The labels are one instructor's judgment, not ground truth.** If you think a label
+is wrong, argue with it in your report — a well-defended disagreement earns credit.
+
+---
+
+## Ideas worth pursuing
+
+Roughly ordered by payoff. You are not expected to do all of these.
+
+**Read the page.** The whole rule layer inspects a string. Fetching the page and
+looking for a named author, a publication date, citations, or a corrections policy is
+the single largest available improvement.
+
+**Use real metadata instead of guesses.** [OpenAlex](https://openalex.org/) and
+[Crossref](https://www.crossref.org/) both expose citation counts, venue, and
+retraction status over free APIs with no key required. That turns "hybrid rule-based
+and ML" from a phrase in the assignment into something you actually built.
+
+**Learn the weights instead of picking them.** Every number in `DOMAIN_SCORES`,
+`TLD_SCORES`, and `PATH_PENALTIES` was typed by hand. Fit them to labelled data with
+a regression, and use lasso to report which features actually carry signal
+(**Session 06**).
+
+**Calibrate, don't just be accurate.** A 0.7 should mean "right about 70% of the
+time." Right now it means "some numbers happened to add to 0.7." A reliability curve
+or a Brier score tells you how wrong that is (**Session 05**).
+
+**Quantify your uncertainty.** An unknown domain and a famous journal both return a
+bare point estimate. Bootstrap a confidence interval and show it in the UI
+(**Session 05**).
+
+**Make the explanation carry its weight.** Right now it is rule names joined by
+semicolons. It should tell a reader *why they should care*. Explanation quality is
+graded separately from score accuracy.
+
+---
+
+## Deliverables and grading
+
+**100 points total = 30% of your course grade**, plus a **+5% bonus** for a Hugging
+Face deployment.
+
+**This project has one deliverable and one deadline.** You submit once, through the
+course form. The date is in [DEADLINES.md](https://github.com/yiqiao-yin/pace-u-cs676/blob/main/DEADLINES.md) — the only place deadlines live.
+
+The three parts below are **where the marks are**, not a schedule. They are listed in
+the order that works best, because each builds on the last and because the report is
+much easier to write once the code exists. You are free to work in any order, or to do
+the whole thing in one go.
+
+### Part 1 — Working function and tests (25 points)
+
+| | Points |
+|---|---|
+| `score_url()` returns the correct contract for valid URLs | 8 |
+| Malformed input handled without raising (`test_credibility.py` passes) | 5 |
+| At least one substantive improvement over the baseline, clearly identified | 7 |
+| Your own added test cases beyond the ones provided | 5 |
+
+### Part 2 — Technique report (35 points)
+
+A written report, 4–8 pages.
+
+| | Points |
+|---|---|
+| Description of your algorithm and why you chose it | 10 |
+| Literature review — existing approaches to credibility assessment, cited | 8 |
+| **Quantitative before/after** using `evaluate.py`, with a results table | 10 |
+| Honest discussion of what still fails and why | 7 |
+
+The measured comparison is the core of this deliverable. "It seems better" earns
+nothing; "MAE fell from 0.142 to 0.081, driven mostly by the held-out block" earns
+full marks.
+
+### Part 3 — Working integrated application (40 points)
+
+| | Points |
+|---|---|
+| Scores display in the running app, legibly and without clutter | 10 |
+| Scorer is robust — no crashes on dead links, timeouts, or odd URLs | 8 |
+| Code comments: 3–5 explanatory lines per section (course standard) | 7 |
+| Novelty — something beyond a longer lookup table, defended | 10 |
+| Live demo runs during your presentation slot | 5 |
+
+---
+
+## Bonus: deploy to Hugging Face (+5%)
+
+Getting the app running on a public URL is worth **an extra 5% on your course grade**.
+It is genuinely more work, which is why it is worth points.
+
+1. Create a **Space** at [huggingface.co/new-space](https://huggingface.co/new-space).
+   Choose the **Streamlit** SDK and the free CPU tier.
+2. Push `main.py`, `credibility.py`, and `requirements.txt` to the Space repo.
+3. Put this at the top of the Space's own `README.md` so it launches the right file:
+
+   ```yaml
+   ---
+   title: Credibility Scored Chatbot
+   sdk: streamlit
+   app_file: main.py
+   pinned: false
+   ---
+   ```
+
+4. Add `ANTHROPIC_API_KEY` under **Settings → Variables and secrets → New secret**.
+   **Never commit your key** — a key pushed to a public Space is a key you must
+   immediately revoke.
+5. Submit the public Space URL alongside your other deliverables.
+
+---
+
+## Troubleshooting
+
+**`ModuleNotFoundError: No module named 'anthropic'`**
+You ran `python something.py` instead of `uv run python something.py`, so it used your
+system Python rather than this project's environment. Add the prefix.
+*On the venv fallback:* your environment isn't active — look for `(.venv)` at the start
+of your prompt, and if it's missing re-run the activate command from [Setup](#setup).
+
+**`uv: command not found`**
+uv isn't installed, or your shell hasn't picked it up yet. Re-run the install command
+from [Setup](#setup), then open a new terminal. If it still fails, use the
+[venv and pip fallback](#fallback-venv-and-pip).
+
+**`TypeError: Messages.create() got an unexpected keyword argument 'output_config'`**
+Your `anthropic` package is too old. `credibility.py` needs **0.120 or newer**.
+With uv this cannot happen — `uv.lock` pins it — so seeing this means you are running
+outside the project environment. Check for the `uv run` prefix.
+```bash
+uv sync                            # uv: restore the locked versions
+pip install --upgrade anthropic    # venv fallback
+```
+
+**`uv sync` fails to resolve, or the lock looks stale**
+Confirm the lock and `pyproject.toml` agree:
+```bash
+uv lock --check
+```
+It should report `Resolved 68 packages`. Do not hand-edit `uv.lock` — if you add a
+dependency, use `uv add <package>`, which updates both files together. Commit both.
+
+**`evaluate.py --llm` gives the same numbers as `evaluate.py`**
+It should not, and on the current version it cannot fail quietly like that — `--llm`
+without a visible key now exits with an explanation instead of scoring. If you are on
+an older clone, `git pull`. Earlier versions of `evaluate.py` did not read `.env`, so
+the key was invisible to it even though the Streamlit sidebar showed a green check,
+and every URL fell back to rules-only scoring with no warning.
+
+**The app loads but every answer is an error**
+Check the sidebar. If "Anthropic API key" shows ❌, your `.env` was not found or the
+key is malformed. The file must be named exactly `.env` (not `.env.txt` — Windows
+Notepad does this silently) and sit in this directory.
+
+**`streamlit: command not found`**
+Run it through uv: `uv run streamlit run main.py`. On the venv fallback, activate the
+environment or run it as a module: `python -m streamlit run main.py`.
+
+**Everything is slow**
+Each chat turn makes a Claude call plus one scoring call per source. Turn off the
+SerpAPI checkbox, or set `JUDGE_MODEL = "claude-haiku-4-5"` in `credibility.py` while
+developing. Say which model produced your submitted numbers.
+
+**I want to work without spending API credits**
+You can do most of the assignment that way. `uv run python evaluate.py` and
+`uv run python test_credibility.py` run the rule layer only and never call the API.
+Only the chat itself and `evaluate.py --llm` need a key.
