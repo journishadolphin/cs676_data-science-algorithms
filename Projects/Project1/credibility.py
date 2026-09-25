@@ -207,10 +207,16 @@ def rule_based_signals(url: str) -> List[Signal]:
         signals.append(Signal("no_https", -0.05, "served over plain HTTP"))
 
     # Signal 4: path keywords suggesting opinion, sponsorship, or user content.
+    PATH_PENALTY_FLOOR = -0.35 
     path = (parsed.path or "").lower()
-    for fragment, delta in PATH_PENALTIES.items():
-        if fragment in path:
-            signals.append(Signal("path", delta, f"URL path contains '{fragment}'"))
+    matched_fragments = [frag for frag in PATH_PENALTIES if frag in path]
+    if matched_fragments:
+        raw_total = sum(PATH_PENALTIES[frag] for frag in matched_fragments)
+        capped_total = max(raw_total, PATH_PENALTY_FLOOR)
+        reason = "URL path contains " + ", ".join(f"'{f}'" for f in matched_fragments)
+        if capped_total != raw_total:
+            reason += f" (penalty capped at {PATH_PENALTY_FLOOR})"
+        signals.append(Signal("path", capped_total, reason))
 
     # Signal 5: a DOI in the path implies a registered scholarly work.
     if re.search(r"/10\.\d{4,9}/", path):
