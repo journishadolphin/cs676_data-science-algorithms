@@ -41,12 +41,17 @@ The final score is a weighted blend of the two. See `score_url()`.
 
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
+import socket
 import sys
+from unittest import signals
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, final
 from urllib.parse import urlparse
 
 # The model used for the Layer 2 judgment. Claude Opus 5 is the most capable
@@ -133,6 +138,7 @@ PATH_PENALTIES: Dict[str, float] = {
     "/advertorial/": -0.25,
     "/forum/": -0.12,
     "/comments/": -0.12,
+    "/~": -0.15,
 }
 
 # Neutral starting point for a URL we know nothing about.
@@ -146,7 +152,17 @@ class Signal:
     name: str      # short machine-readable label, e.g. "known_domain"
     value: float   # the score or delta this signal contributed
     reason: str    # human-readable sentence for the explanation field
+    source: str = "url"
 
+def _llm_weight(signals: list[Signal]) -> float:
+    """Give the LLM more influence when the rule layer has weaker evidence."""
+    base_signal = signals[0] if signals else None
+
+    if base_signal is None or base_signal.name == "unknown":
+        return 0.50
+    if base_signal.name == "tld":
+        return 0.45
+    return 0.30
 
 def _normalize_domain(url: str) -> str:
     """
@@ -225,20 +241,174 @@ def rule_based_signals(url: str) -> List[Signal]:
 
     return signals
 
+PAGE_FETCH_TIMEOUT = 2.5
+MAX_PAGE_BYTES = 200_000
+
+
+def _fetch_page_signals(url: str) -> List[Signal]:
+    """
+    Fetch a small bounded portion of the page and inspect basic metadata.
+
+    This is deliberately lightweight: it does not attempt to understand the
+    article itself. It looks for common credibility indicators such as an
+    author, publication date, citation metadata, and obvious user-generated
+    content. Network failures return no signals rather than raising.
+    """
+    signals: List[Signal] = []
+
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "CS676-Credibility-Checker/1.0"
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(
+            request,
+            timeout=PAGE_FETCH_TIMEOUT,
+        ) as response:
+            content_type = response.headers.get("Content-Type", "")
+
+            if "text/html" not in content_type.lower():
+                return signals
+
+            raw = response.read(MAX_PAGE_BYTES)
+            text = raw.decode("utf-8", errors="ignore").lower()
+
+    except (
+        urllib.error.URLError,
+        urllib.error.HTTPError,
+        TimeoutError,
+        socket.timeout,
+        ValueError,
+    ):
+        return signals
+
+    text = html.unescape(text)
+
+    # Named author metadata is a weak positive signal.
+    if (
+        'name="author"' in text
+        or 'property="article:author"' in text
+        or "byline" in text
+    ):
+        signals.append(
+            Signal(
+                "page_author",
+                0.04,
+                "page metadata identifies an author",
+                source="page",
+            )
+        )
+
+    # Publication date metadata is another weak positive signal.
+    if (
+        'name="date"' in text
+        or 'property="article:published_time"' in text
+        or "datepublished" in text
+    ):
+        signals.append(
+            Signal(
+                "page_date",
+                0.03,
+                "page metadata identifies a publication date",
+                source="page",
+            )
+        )
+
+    # Citation/reference markers provide modest evidence of research-oriented
+    # content, but are intentionally not treated as proof of quality.
+    if (
+        "<cite" in text
+        or "references" in text
+        or "bibliography" in text
+        or "citation" in text
+    ):
+        signals.append(
+            Signal(
+                "page_citations",
+                0.05,
+                "page contains citation or reference indicators",
+                source="page",
+            )
+        )
+
+    # Obvious user-generated discussion is a weak negative signal.
+    if (
+        "comments" in text
+        and (
+            "leave a comment" in text
+            or "reply to this comment" in text
+        )
+    ):
+        signals.append(
+            Signal(
+                "page_comments",
+                -0.05,
+                "page contains user-comment indicators",
+                source="page",
+            )
+        )
+
+    return signals
+
+
+
+
+MAX_PATH_PENALTY = -0.35
+MAX_PAGE_ADJUSTMENT = 0.12
+
 
 def _combine_signals(signals: List[Signal]) -> float:
     """
-    Fold the signal list into a single number in [0, 1].
+    Combine URL and page evidence while limiting correlated signals.
 
-    The first signal is treated as the base score (it is always the domain or
-    TLD judgment) and every later signal is an additive adjustment. This is a
-    crude aggregation — see KNOWN WEAKNESSES.
+    The domain/TLD establishes the baseline. URL warnings can accumulate up to
+    a fixed penalty, while page metadata is intentionally capped because HTML
+    metadata is weak evidence and can be fabricated by publishers.
     """
     if not signals:
         return NEUTRAL_SCORE
+
     base = signals[0].value
-    adjustment = sum(s.value for s in signals[1:])
-    return max(0.0, min(1.0, base + adjustment))
+
+    path_adjustment = sum(
+        signal.value
+        for signal in signals
+        if signal.source == "url"
+        and signal.name == "path"
+        and signal.value < 0
+    )
+    path_adjustment = max(path_adjustment, MAX_PATH_PENALTY)
+
+    other_url_adjustments = sum(
+        signal.value
+        for signal in signals[1:]
+        if signal.source == "url"
+        and signal.name != "path"
+    )
+
+    page_adjustment = sum(
+        signal.value
+        for signal in signals
+        if signal.source == "page"
+    )
+    page_adjustment = max(
+        -MAX_PAGE_ADJUSTMENT,
+        min(MAX_PAGE_ADJUSTMENT, page_adjustment),
+    )
+
+    return max(
+        0.0,
+        min(
+            1.0,
+            base
+            + path_adjustment
+            + other_url_adjustments
+            + page_adjustment,
+        ),
+    )
 
 
 # =============================================================================
@@ -406,16 +576,33 @@ def llm_opinion(url: str) -> Optional[Signal]:
 # same paper on every turn), so results are memoized for the process lifetime.
 _CACHE: Dict[Tuple[str, Optional[bool]], Dict[str, Any]] = {}
 
+ENABLE_PAGE_FETCH = os.getenv("CREDIBILITY_FETCH_PAGES", "1") == "1"
 
 def score_url(url: str, use_llm: Optional[bool] = None) -> Dict[str, Any]:
     """
     Score the credibility of a source URL.
 
-    :param url:     The URL to evaluate.
-    :param use_llm: True forces the Claude judgment, False forces rules-only,
-                    None (default) uses the LLM when an API key is available.
-    :return:        {"score": float in [0,1], "explanation": str}
+    :param url: URL to evaluate.
+    :param use_llm: True forces Claude, False disables it, None uses it when
+                    an API key is available.
+    :return: {"score": float in [0, 1], "explanation": str}
     """
+    if not isinstance(url, str) or not url.strip():
+        return {
+            "score": 0.0,
+            "explanation": "No URL was provided.",
+        }
+
+    url = url.strip()
+
+    parsed = urlparse(url)
+
+    if parsed.scheme not in ("http", "https") or not _normalize_domain(url):
+        return {
+            "score": 0.0,
+            "explanation": f"'{url}' is not a valid http(s) URL.",
+        }
+
     cache_key = (url, use_llm)
     if cache_key in _CACHE:
         return dict(_CACHE[cache_key])
@@ -431,6 +618,9 @@ def score_url(url: str, use_llm: Optional[bool] = None) -> Dict[str, Any]:
 
     # Layer 1 always runs.
     signals = rule_based_signals(url)
+    if ENABLE_PAGE_FETCH:
+        signals.extend(_fetch_page_signals(url))
+
     rule_score = _combine_signals(signals)
     parts = [s.reason for s in signals]
 
@@ -438,7 +628,9 @@ def score_url(url: str, use_llm: Optional[bool] = None) -> Dict[str, Any]:
     # rule score stands on its own.
     llm = llm_opinion(url) if use_llm is not False else None
     if llm is not None:
-        final = RULE_WEIGHT * rule_score + LLM_WEIGHT * llm.value
+        llm_weight = _llm_weight(signals)
+        rule_weight = 1.0 - llm_weight
+        final = rule_weight * rule_score + llm_weight * llm.value
         parts.append(f"model judgment {llm.value:.2f} — {llm.reason}")
     else:
         final = rule_score
@@ -461,6 +653,7 @@ def score_band(score: float) -> Tuple[str, str]:
     if score >= 0.40:
         return "MEDIUM", "orange"
     return "LOW", "red"
+
 
 
 # =============================================================================
