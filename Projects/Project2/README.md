@@ -30,7 +30,9 @@ Smaller fixes that came with it:
 - `/usage` shows API calls and tokens spent this session.
 - `--router-model` lets a cheaper model handle routing.
 
-Design rationale, tool schemas and alternatives I rejected: **[docs/DESIGN.md](docs/DESIGN.md)**.
+Design rationale, tool schemas, alternatives I rejected, annotated live transcripts, failure
+analysis and measured cost: **[docs/DESIGN.md](docs/DESIGN.md)**. The raw live-run output, run with
+`claude-haiku-4-5`, is in [`docs/transcripts/`](docs/transcripts/).
 Tests: `uv run pytest`, 76 tests, all offline.
 
 **Platform notes:** a clean clone ran with `uv sync` → `uv run pytest` → `uv run main.py --offline`
